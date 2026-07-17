@@ -392,3 +392,217 @@ size_t rgb565_qoi_decompress(const uint8_t *input,
 
     return (size_t)px_pos;
 }
+
+size_t rgb565_qoi_decompress_callback(const uint8_t *input,
+                                      size_t input_size,
+                                      uint16_t width,
+                                      uint16_t *buf_a,
+                                      uint16_t *buf_b,
+                                      size_t buf_capacity,
+                                      rgb565_qoi_callback callback,
+                                      void *user_data)
+{
+    uint16_t  index[QOI_INDEX_SIZE];
+    uint16_t  px;
+    uint32_t  total_pixels;
+    int       chunks_len;
+    int       p;
+    int       run;
+    int       i;
+
+    size_t    pixel_count;   /* number of pixels emitted so far */
+    uint16_t  x;             /* current column within the image */
+    uint16_t  y;             /* current row within the image */
+    size_t    acc_count;     /* pixels accumulated in active buf */
+    uint16_t  acc_x;         /* starting column of current batch */
+    uint16_t  acc_y;         /* row of current batch */
+    uint16_t *buf;           /* active buffer (buf_a, or toggles) */
+
+    /* --- parameter validation --- */
+    if ((input == NULL) || (callback == NULL) || (buf_a == NULL) ||
+        (input_size < QOI_HEADER_SIZE + QOI_PADDING_SIZE) ||
+        (width == 0u) || (buf_capacity == 0u)) {
+        return 0u;
+    }
+
+    /* --- validate magic bytes --- */
+    if ((input[0] != QOI_MAGIC_0) ||
+        (input[1] != QOI_MAGIC_1) ||
+        (input[2] != QOI_MAGIC_2) ||
+        (input[3] != QOI_MAGIC_3)) {
+        return 0u;  /* not a QOI-for-RGB565 stream */
+    }
+
+    /* --- read header --- */
+    p = 4;
+    total_pixels = qoi_read_u32(input, &p);
+
+    if (total_pixels == 0u) {
+        return 0u;  /* empty image is not meaningful */
+    }
+
+    /*
+     * Chunks end before the 8-byte end marker.
+     */
+    chunks_len = (int)input_size - (int)QOI_PADDING_SIZE;
+
+    /* --- zero-initialise the seen-pixel index --- */
+    for (i = 0; i < (int)QOI_INDEX_SIZE; i++) {
+        index[i] = 0u;
+    }
+
+    /*
+     * Initialise previous pixel to black {0,0,0}.
+     */
+    px  = 0x0000u;
+    run = 0;
+
+    pixel_count = 0u;
+    x           = 0u;
+    y           = 0u;
+    acc_count   = 0u;
+    acc_x       = 0u;
+    acc_y       = 0u;
+    buf         = buf_a;
+
+    /*
+     * Helper macro: flush accumulated pixels to the callback.
+     * Computes the bounding rectangle which may span multiple rows.
+     * When buf_b is non-NULL the active buffer toggles (ping-pong).
+     */
+#define FLUSH()                                                      \
+    do {                                                             \
+        size_t lp;                                                   \
+        lp = (size_t)acc_y * width + acc_x + acc_count - 1u;        \
+        callback(buf, acc_count, acc_x, acc_y,                       \
+                 (uint16_t)(lp % width), (uint16_t)(lp / width),     \
+                 user_data);                                         \
+        acc_count = 0u;                                              \
+        acc_x     = x;                                               \
+        acc_y     = y;                                               \
+        if (buf_b != NULL) {                                         \
+            buf = (buf == buf_a) ? buf_b : buf_a;                    \
+        }                                                            \
+    } while (0)
+
+    /*
+     * Helper macro: emit a single pixel into the accumulation buffer,
+     * handling row-wrapping and flushing when the buffer is full.
+     */
+#define EMIT_PIXEL(pixel_val)                                        \
+    do {                                                             \
+        if (acc_count == 0u) {                                       \
+            acc_x = x;                                               \
+            acc_y = y;                                               \
+        }                                                            \
+        buf[acc_count++] = (pixel_val);                              \
+        x++;                                                         \
+        if (x >= width) {                                            \
+            x = 0u;                                                  \
+            y++;                                                     \
+        }                                                            \
+        if (acc_count >= buf_capacity) {                             \
+            FLUSH();                                                 \
+        }                                                            \
+    } while (0)
+
+    /* --- decode --- */
+    {
+        size_t px_pos;
+        size_t px_len = (size_t)total_pixels;
+
+        for (px_pos = 0u; px_pos < px_len; px_pos++) {
+            if (run > 0) {
+                run--;
+                EMIT_PIXEL(px);
+                pixel_count++;
+            } else if (p < chunks_len) {
+                int b1 = (int)input[p++];
+
+                if (b1 == QOI_OP_RGB565) {
+                    /* --- QOI_OP_RGB565: full pixel (2 bytes LE) --- */
+                    px = qoi_read_u16(input, &p);
+                    index[qoi_color_hash(px) & 0x3Fu] = px;
+                    EMIT_PIXEL(px);
+                    pixel_count++;
+                } else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
+                    /* --- QOI_OP_INDEX: lookup in seen-pixel array --- */
+                    px = index[b1 & QOI_MASK_6];
+                    index[qoi_color_hash(px) & 0x3Fu] = px;
+                    EMIT_PIXEL(px);
+                    pixel_count++;
+                } else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
+                    /* --- QOI_OP_DIFF: small per-channel differences --- */
+                    unsigned int r = (px >> 11) & 0x1Fu;
+                    unsigned int g = (px >>  5) & 0x3Fu;
+                    unsigned int b =  px        & 0x1Fu;
+
+                    r = (r + (((b1 >> 4) & 0x03u) - 2)) & 0x1Fu;
+                    g = (g + (((b1 >> 2) & 0x03u) - 2)) & 0x3Fu;
+                    b = (b + ( (b1      ) & 0x03u)  - 2) & 0x1Fu;
+
+                    px = (uint16_t)((r << 11) | (g << 5) | b);
+                    index[qoi_color_hash(px) & 0x3Fu] = px;
+                    EMIT_PIXEL(px);
+                    pixel_count++;
+                } else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
+                    /* --- QOI_OP_LUMA: green diff + r-g and b-g deltas --- */
+                    int b2;
+                    int vg;
+
+                    b2 = (int)input[p++];
+                    vg = (b1 & QOI_MASK_6) - 32;
+
+                    {
+                        unsigned int r = (px >> 11) & 0x1Fu;
+                        unsigned int g = (px >>  5) & 0x3Fu;
+                        unsigned int b =  px        & 0x1Fu;
+
+                        r = (r + vg - 8 + ((b2 >> 4) & 0x0Fu)) & 0x1Fu;
+                        g = (g + vg)                           & 0x3Fu;
+                        b = (b + vg - 8 +  (b2       & 0x0Fu)) & 0x1Fu;
+
+                        px = (uint16_t)((r << 11) | (g << 5) | b);
+                    }
+                    index[qoi_color_hash(px) & 0x3Fu] = px;
+                    EMIT_PIXEL(px);
+                    pixel_count++;
+                } else if ((b1 & QOI_MASK_2) == QOI_OP_RUN) {
+                    /* --- QOI_OP_RUN: repeat previous pixel --- */
+                    run = b1 & QOI_MASK_6;
+                    /* The first repetition is emitted now, subsequent
+                     * ones via the run counter in the next iterations. */
+                    index[qoi_color_hash(px) & 0x3Fu] = px;
+                    EMIT_PIXEL(px);
+                    pixel_count++;
+                }
+                /* else: unknown chunk type — fall through, px unchanged */
+            }
+            /* else: no more chunk data and no run — keep px unchanged.
+             * The loop still iterates (bounded by px_len), so this
+             * cannot infinite-loop on truncated streams. */
+        }
+    }
+
+#undef EMIT_PIXEL
+#undef FLUSH
+
+    /* --- final flush --- */
+    if (acc_count > 0u) {
+        size_t last_pos;
+
+        last_pos = (size_t)acc_y * width
+                 + acc_x + acc_count - 1u;
+        callback(buf, acc_count, acc_x, acc_y,
+                 (uint16_t)(last_pos % width),
+                 (uint16_t)(last_pos / width),
+                 user_data);
+    }
+
+    /* --- verify we emitted exactly the declared number of pixels --- */
+    if (pixel_count != total_pixels) {
+        return 0u;  /* truncated or corrupt stream */
+    }
+
+    return pixel_count;
+}
