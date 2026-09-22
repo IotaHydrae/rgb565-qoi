@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Commits
+
+- Author, committer and `Signed-off-by` must all be **`Wooden Chair <hua.zheng@embeddedboys.com>`**
+  (`user.name` / `user.email` are already set in this repo). Always commit with `git commit -s`.
+- Kernel-style subject (`<area>: <what>`), one logical change per commit; the body states what changed,
+  why, and the measured effect.
+- Do not commit after every edit — commit when asked. Never rewrite pushed history, and never push
+  without explicit permission.
+
 ## Build & Test
 
 ```bash
